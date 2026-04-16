@@ -19,9 +19,12 @@ const int potPinA0 = A0;
 const int resetButtonPin = 25;
 const unsigned long odriveBaudrate = 115200;
 const unsigned long pollIntervalMs = 250;
+const float powerFilterAlpha = 1.0f; //0.1  bigger number = less filtering
 float currentSoftMaxMax = 70.0f;
 float lastSentCurrentSoftMax = -1.0f;
 float wattHours = 0.00f;
+float filteredPower = 0.0f;
+bool powerFilterInitialized = false;
 
 const int graphY = 56;
 const int graphHeight = screenHeight - graphY;
@@ -35,6 +38,17 @@ ODriveUART odrive(odriveSerial);
 
 unsigned long lastPollMs = 0;
 bool odriveConnected = false;
+
+float filterPower(float rawPower) {
+  if (!powerFilterInitialized) {
+    filteredPower = rawPower;
+    powerFilterInitialized = true;
+    return filteredPower;
+  }
+
+  filteredPower += (rawPower - filteredPower) * powerFilterAlpha;
+  return filteredPower;
+}
 
 void appendGraphSample(float rpm, float power) {
   if (graphCount < screenWidth) {
@@ -144,7 +158,7 @@ void redrawDisplay(const char* stateText, float vbusVoltage, float busCurrent, f
   snprintf(line, sizeof(line), "%.0fA", motorPhaseCurrent);
   lcd.print(line);
   lcd.setTextColor(ST77XX_GREEN);
-  snprintf(line, sizeof(line), " %.1fWh", wattHours);
+  snprintf(line, sizeof(line), " %.2fWh", wattHours);
   lcd.print(line);
 }
 
@@ -226,8 +240,8 @@ void setup() {
     currentSoftMaxMax = hardCurrentMax * 0.9f;
   }
   const float busCurrent = odrive.getParameterAsFloat("ibus");
-  const float motorPhaseCurrent = odrive.getParameterAsFloat("axis0.motor.foc.Iq_measured");
-  const float power = busCurrent * motorPhaseCurrent;
+  const float motorPhaseCurrent = -odrive.getParameterAsFloat("axis0.motor.foc.Iq_measured");
+  const float power = filterPower(-odrive.getParameterAsFloat("axis0.motor.electrical_power"));
   const float rpm = odrive.getFeedback().vel * 60.0f;
   redrawDisplay("CLOSED LOOP", vbusVoltage, busCurrent, motorPhaseCurrent, power, rpm, true, 0.0f);
   appendGraphSample(rpm, power);
@@ -248,8 +262,9 @@ void loop() {
 
   const int a3Raw = analogRead(potPinA3);
   const int a0Raw = analogRead(potPinA0);
-  const float targetCurrentSoftMax = (a3Raw * currentSoftMaxMax) / 4095.0f;
   const float targetRpm = (a0Raw * 8000.0f) / 4095.0f;
+  const float targetCurrentSoftMaxFromPot = (a3Raw * currentSoftMaxMax) / 4095.0f;
+  const float targetCurrentSoftMax = (targetRpm < 20.0f) ? 0.0f : targetCurrentSoftMaxFromPot;
   const float targetVelRevPerSec = targetRpm / 60.0f;
 
   Serial.print("A3: ");
@@ -267,6 +282,8 @@ void loop() {
   odriveConnected = state != AXIS_STATE_UNDEFINED;
 
   if (!odriveConnected) {
+    powerFilterInitialized = false;
+    filteredPower = 0.0f;
     redrawDisplay("WAITING", 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, wattHours);
     appendGraphSample(0.0f, 0.0f);
     drawGraph();
@@ -282,12 +299,10 @@ void loop() {
 
   const float vbusVoltage = odrive.getParameterAsFloat("vbus_voltage");
   const float busCurrent = odrive.getParameterAsFloat("ibus");
-  const float motorPhaseCurrent = odrive.getParameterAsFloat("axis0.motor.foc.Iq_measured");
-  const float power = busCurrent * motorPhaseCurrent;
+  const float motorPhaseCurrent = -odrive.getParameterAsFloat("axis0.motor.foc.Iq_measured");
+  const float power = filterPower(-odrive.getParameterAsFloat("axis0.motor.electrical_power"));
   const float rpm = odrive.getFeedback().vel * 60.0f;
-  if (power > 0.0f) {
-    wattHours += power * (pollIntervalMs / 1000.0f / 3600.0f);
-  }
+  wattHours += power * (pollIntervalMs / 1000.0f / 3600.0f);
 
   redrawDisplay(
     axisStateToText(state),
