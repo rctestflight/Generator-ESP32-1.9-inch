@@ -2,6 +2,7 @@
 #include <Adafruit_ST7789.h>
 #include <ODriveUART.h>
 #include <SPI.h>
+#include <HX711.h>
 
 #define LCD_MOSI 23
 #define LCD_SCK 18
@@ -18,8 +19,9 @@ const int potPinA3 = A3;
 const int potPinA0 = A0;
 const int resetButtonPin = 25;
 const unsigned long odriveBaudrate = 115200;
-const unsigned long pollIntervalMs = 250;
-const float powerFilterAlpha = 1.0f; //0.1  bigger number = less filtering
+const unsigned long pollIntervalMs = 100;
+const float powerFilterAlpha = 1.0f; //0.1 bigger number = less filtering
+const double rateFilterAlpha = 1.0f; // Smaller number = smoother rate value
 float currentSoftMaxMax = 70.0f;
 float lastSentCurrentSoftMax = -1.0f;
 float wattHours = 0.00f;
@@ -39,6 +41,21 @@ ODriveUART odrive(odriveSerial);
 unsigned long lastPollMs = 0;
 bool odriveConnected = false;
 
+// ---------------- HX711 ----------------
+HX711 scale;
+const int LOADCELL_DOUT_PIN = 5;
+const int LOADCELL_SCK_PIN = 19;
+const int numReadings = 10; // Loadcell Filtering
+double readings[numReadings]; // Array to store filtered sensor readings with decimal precision
+int readIndex = 0; // The index of the current reading in the array
+double total = 0.0; // Running sum for moving average
+double weight = 0.0;
+double weightRateGPerMin = 0.0;
+double filteredWeightRateGPerMin = 0.0;
+bool rateFilterInitialized = false;
+double lastWeightForRate = 0.0;
+unsigned long lastRateCalcMs = 0;
+
 float filterPower(float rawPower) {
   if (!powerFilterInitialized) {
     filteredPower = rawPower;
@@ -48,6 +65,17 @@ float filterPower(float rawPower) {
 
   filteredPower += (rawPower - filteredPower) * powerFilterAlpha;
   return filteredPower;
+}
+
+double filterWeightRate(double rawRateGPerMin) {
+  if (!rateFilterInitialized) {
+    filteredWeightRateGPerMin = rawRateGPerMin;
+    rateFilterInitialized = true;
+    return filteredWeightRateGPerMin;
+  }
+
+  filteredWeightRateGPerMin += (rawRateGPerMin - filteredWeightRateGPerMin) * rateFilterAlpha;
+  return filteredWeightRateGPerMin;
 }
 
 void appendGraphSample(float rpm, float power) {
@@ -246,6 +274,16 @@ void setup() {
   redrawDisplay("CLOSED LOOP", vbusVoltage, busCurrent, motorPhaseCurrent, power, rpm, true, 0.0f);
   appendGraphSample(rpm, power);
   drawGraph();
+
+    //HX711 Setup------------
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  Serial.println("HX711 initialized");
+  scale.set_scale(-700); //-760.8
+  scale.set_offset(150086); //507060
+  // Initialize all the readings to 0:
+  for (int i = 0; i < numReadings; i++) {
+      readings[i] = 0.0;
+      }  
 }
 
 void loop() {
@@ -260,22 +298,53 @@ void loop() {
     wattHours = 0.0f;
   }
 
+  //HX711 Measure ------------
+  total = total - readings[readIndex]; // Subtract the old reading
+  readings[readIndex] = scale.get_units(1); // Keep fractional precision from HX711 calibration units
+  total = total + readings[readIndex]; // Add the new reading to the total
+  readIndex = readIndex + 1; // Advance to the next position in the array
+
+  if (readIndex >= numReadings) {  // If we're at the end of the array...
+    readIndex = 0; // ...wrap around to the beginning
+      }
+    
+  weight = total / numReadings; // Calculate the average
+
+  if (digitalRead(resetButtonPin) == LOW) { 
+    scale.tare(20);
+    Serial.println("TARE");
+    Serial.print("HX711 offset: ");
+    Serial.println(scale.get_offset());
+    weightRateGPerMin = 0.0;
+    filteredWeightRateGPerMin = 0.0;
+    rateFilterInitialized = false;
+    lastWeightForRate = weight;
+    lastRateCalcMs = now;
+    }
+
+  if (lastRateCalcMs == 0) {
+    lastRateCalcMs = now;
+    lastWeightForRate = weight;
+    weightRateGPerMin = 0.0;
+    filteredWeightRateGPerMin = 0.0;
+    rateFilterInitialized = false;
+  } else {
+    const unsigned long elapsedMs = now - lastRateCalcMs;
+    if (elapsedMs > 0) {
+      const double elapsedMinutes = (double)elapsedMs / 60000.0;
+      const double rawWeightRateGPerMin = (weight - lastWeightForRate) / elapsedMinutes;
+      weightRateGPerMin = filterWeightRate(rawWeightRateGPerMin);
+      lastRateCalcMs = now;
+      lastWeightForRate = weight;
+    }
+  }
+
   const int a3Raw = analogRead(potPinA3);
   const int a0Raw = analogRead(potPinA0);
   const float targetRpm = (a0Raw * 8000.0f) / 4095.0f;
   const float targetCurrentSoftMaxFromPot = (a3Raw * currentSoftMaxMax) / 4095.0f;
   const float targetCurrentSoftMax = (targetRpm < 20.0f) ? 0.0f : targetCurrentSoftMaxFromPot;
   const float targetVelRevPerSec = targetRpm / 60.0f;
-
-  Serial.print("A3: ");
-  Serial.print(a3Raw);
-  Serial.print(" A0: ");
-  Serial.print(a0Raw);
-  Serial.print(" I Limit: ");
-  Serial.print(targetCurrentSoftMax, 2);
-  Serial.print(" A");
-  Serial.print(" Target RPM: ");
-  Serial.println(targetRpm, 1);
 
 
   const ODriveAxisState state = odrive.getState();
@@ -302,6 +371,19 @@ void loop() {
   const float motorPhaseCurrent = -odrive.getParameterAsFloat("axis0.motor.foc.Iq_measured");
   const float power = filterPower(-odrive.getParameterAsFloat("axis0.motor.electrical_power"));
   const float rpm = odrive.getFeedback().vel * 60.0f;
+
+
+ // Serial.print("I Limit: ");
+ // Serial.print(targetCurrentSoftMax, 2);
+ // Serial.print(" Weight: ");
+  Serial.println(weight); 
+ // Serial.print(" Rate: ");
+ // Serial.println(weightRateGPerMin, 2);
+ // Serial.print(" Power: ");
+ // Serial.print(power);
+ // Serial.print(" RPM: ");
+ // Serial.println(rpm, 1);
+
   wattHours += power * (pollIntervalMs / 1000.0f / 3600.0f);
 
   redrawDisplay(
