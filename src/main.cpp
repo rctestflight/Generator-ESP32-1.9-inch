@@ -953,6 +953,21 @@ void loop() {
 
   writeServoPulseUs(servoPulseUs);
 
+  // Request bus voltage/current and motor Iq (not broadcast; must be polled).
+  {
+    Get_Bus_Voltage_Current_msg_t busVI;
+    if (odrive.getBusVI(busVI, 10)) {
+      odriveUserData.last_vbus = busVI;
+      odriveUserData.received_vbus = true;
+      odriveUserData.last_vbus_ms = now;
+    }
+  }
+  Get_Iq_msg_t iqMsg;
+  float motorIqA = 0.0f;
+  if (odrive.getCurrents(iqMsg, 10)) {
+    motorIqA = iqMsg.Iq_Measured;
+  }
+
   if (canMonitorOnlyMode) {
     const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
     const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
@@ -965,7 +980,7 @@ void loop() {
       axisStateToText(state),
       vbusVoltage,
       busCurrent,
-      0.0f,
+      motorIqA,
       power,
       rpm,
       false,
@@ -1014,7 +1029,7 @@ void loop() {
       axisStateToText(state),
       vbusVoltage,
       busCurrent,
-      0.0f,
+      motorIqA,
       power,
       rpm,
       false,
@@ -1041,7 +1056,7 @@ void loop() {
 
   const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
   const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
-  const float motorPhaseCurrent = 0.0f;
+  const float motorPhaseCurrent = motorIqA;
   const float torque = 0.0f;
   const float power = filterPower(vbusVoltage * busCurrent);
   const float rpm = odriveUserData.received_feedback
