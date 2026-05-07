@@ -742,7 +742,7 @@ void setup() {
 
   const unsigned long heartbeatTimeoutMs = millis() + 8000;
   unsigned long nextHeartbeatStatusPrintMs = 0;
-  while (!(odriveUserData.received_heartbeat || odriveUserData.received_feedback || odriveUserData.received_vbus)
+  while (!(odriveUserData.received_heartbeat && odriveUserData.received_feedback && odriveUserData.received_vbus)
          && millis() < heartbeatTimeoutMs) {
     pumpEvents(can_intf);
 
