@@ -24,7 +24,7 @@ const int resetButtonPin = 25;
 const long canBaudrate = 1000000;
 const int odriveNodeId = 0;
 const unsigned long pollIntervalMs = 100;
-const bool canMonitorOnlyMode = true;
+const bool canMonitorOnlyMode = false;
 const float maxTargetRpm = 8000.0f;
 const float testSequenceSetpointThresholdRpm = 2500.0f;
 const float powerFilterAlpha = 0.8f; //0.1 bigger number = less filtering
@@ -742,8 +742,7 @@ void setup() {
 
   const unsigned long heartbeatTimeoutMs = millis() + 8000;
   unsigned long nextHeartbeatStatusPrintMs = 0;
-  while (!(odriveUserData.received_heartbeat && odriveUserData.received_feedback && odriveUserData.received_vbus)
-         && millis() < heartbeatTimeoutMs) {
+  while (!odriveUserData.received_heartbeat && millis() < heartbeatTimeoutMs) {
     pumpEvents(can_intf);
 
     const unsigned long nowMs = millis();
