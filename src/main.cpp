@@ -191,6 +191,8 @@ struct ODriveUserData {
   Get_Bus_Voltage_Current_msg_t last_vbus;
   bool received_vbus = false;
   unsigned long last_vbus_ms = 0;
+  Get_Torques_msg_t last_torques;
+  bool received_torques = false;
 } odriveUserData;
 
 unsigned long lastPollMs = 0;
@@ -223,6 +225,12 @@ void onVbus(Get_Bus_Voltage_Current_msg_t& msg, void* user_data) {
   d->last_vbus = msg;
   d->received_vbus = true;
   d->last_vbus_ms = millis();
+}
+
+void onTorques(Get_Torques_msg_t& msg, void* user_data) {
+  ODriveUserData* d = static_cast<ODriveUserData*>(user_data);
+  d->last_torques = msg;
+  d->received_torques = true;
 }
 
 void onCanMessage(const CanMsg& msg) {
@@ -731,6 +739,7 @@ void setup() {
   odrive.onStatus(onHeartbeat, &odriveUserData);
   odrive.onFeedback(onFeedback, &odriveUserData);
   odrive.onBusVI(onVbus, &odriveUserData);
+  odrive.onTorques(onTorques, &odriveUserData);
 
   if (!setupCan()) {
     Serial.println("CAN init failed");
@@ -1057,7 +1066,7 @@ void loop() {
   const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
   const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
   const float motorPhaseCurrent = motorIqA;
-  const float torque = 0.0f;
+  const float torque = odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f;
   const float power = filterPower(vbusVoltage * busCurrent);
   const float rpm = odriveUserData.received_feedback
     ? filterRpm(odriveUserData.last_feedback.Vel_Estimate * 60.0f)
