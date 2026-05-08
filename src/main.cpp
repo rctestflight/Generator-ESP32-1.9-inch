@@ -193,6 +193,11 @@ struct ODriveUserData {
   unsigned long last_vbus_ms = 0;
   Get_Torques_msg_t last_torques;
   bool received_torques = false;
+  Get_Iq_msg_t last_iq;
+  bool received_iq = false;
+  unsigned long last_iq_ms = 0;
+  Get_Error_msg_t last_error;
+  bool received_error = false;
 } odriveUserData;
 
 unsigned long lastPollMs = 0;
@@ -202,12 +207,23 @@ int testSequencePulseUs = servoPulseMinUs;
 unsigned long testSequenceStepStartMs = 0;
 int lastResetButtonState = HIGH;
 unsigned long nextClosedLoopRequestMs = 0;
-unsigned long nextErrorQueryMs = 0;
 volatile uint32_t rawCanRxCount = 0;
 volatile uint32_t lastRawCanId = 0;
 
 void onHeartbeat(Heartbeat_msg_t& msg, void* user_data) {
   ODriveUserData* d = static_cast<ODriveUserData*>(user_data);
+  static uint8_t prev_state = 0xff;
+  if (msg.Axis_State != prev_state) {
+    Serial.print("HB state ");
+    Serial.print(prev_state);
+    Serial.print("->");
+    Serial.print(msg.Axis_State);
+    Serial.print(" err=0x");
+    Serial.print(msg.Axis_Error, HEX);
+    Serial.print(" pr=");
+    Serial.println(msg.Procedure_Result);
+    prev_state = msg.Axis_State;
+  }
   d->last_heartbeat = msg;
   d->received_heartbeat = true;
   d->last_heartbeat_ms = millis();
@@ -233,6 +249,29 @@ void onTorques(Get_Torques_msg_t& msg, void* user_data) {
   d->received_torques = true;
 }
 
+void onCurrents(Get_Iq_msg_t& msg, void* user_data) {
+  ODriveUserData* d = static_cast<ODriveUserData*>(user_data);
+  d->last_iq = msg;
+  d->received_iq = true;
+  d->last_iq_ms = millis();
+}
+
+void onError(Get_Error_msg_t& msg, void* user_data) {
+  ODriveUserData* d = static_cast<ODriveUserData*>(user_data);
+  static uint32_t prev_active = 0;
+  static uint32_t prev_disarm = 0;
+  if (msg.Active_Errors != prev_active || msg.Disarm_Reason != prev_disarm) {
+    Serial.print("ODrive Active_Errors=0x");
+    Serial.print(msg.Active_Errors, HEX);
+    Serial.print(" Disarm_Reason=0x");
+    Serial.println(msg.Disarm_Reason, HEX);
+    prev_active = msg.Active_Errors;
+    prev_disarm = msg.Disarm_Reason;
+  }
+  d->last_error = msg;
+  d->received_error = true;
+}
+
 void onCanMessage(const CanMsg& msg) {
   rawCanRxCount++;
   lastRawCanId = msg.id;
@@ -245,6 +284,10 @@ bool setupCan() {
     (gpio_num_t)canRxPin,
     TWAI_MODE_NORMAL
   );
+  // Default rx_queue_len is 5; LCD redraw can block pumpEvents long enough
+  // to drop heartbeats with 6+ broadcast streams enabled on the ODrive.
+  g_config.rx_queue_len = 64;
+  g_config.tx_queue_len = 16;
   twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -301,14 +344,24 @@ bool requestClosedLoopIfSafe(unsigned long now, bool logState) {
   }
 
   if (odriveUserData.last_heartbeat.Axis_Error != 0) {
-    odrive.clearErrors();
-  }
+  Serial.println("ODRIVE ERROR DETECTED:");
+  Serial.print("\tHeartbeat Axis_Error=0x");
+  Serial.print(odriveUserData.last_heartbeat.Axis_Error, HEX);
+  Serial.print("\tProcedure_Result=");
+  Serial.println(odriveUserData.last_heartbeat.Procedure_Result);
+  odrive.clearErrors();
+}
+
 
   nextClosedLoopRequestMs = now + 500;
   const bool ok = odrive.setState(AXIS_STATE_CLOSED_LOOP_CONTROL);
   if (logState) {
     Serial.print("Requesting CLOSED_LOOP, send=");
-    Serial.println(ok ? "OK" : "FAIL");
+    Serial.print(ok ? "OK" : "FAIL");
+    Serial.print(" hb_state=");
+    Serial.print(odriveUserData.last_heartbeat.Axis_State);
+    Serial.print(" hb_age_ms=");
+    Serial.println(now - odriveUserData.last_heartbeat_ms);
   }
   return ok;
 }
@@ -740,6 +793,8 @@ void setup() {
   odrive.onFeedback(onFeedback, &odriveUserData);
   odrive.onBusVI(onVbus, &odriveUserData);
   odrive.onTorques(onTorques, &odriveUserData);
+  odrive.onCurrents(onCurrents, &odriveUserData);
+  odrive.onError(onError, &odriveUserData);
 
   if (!setupCan()) {
     Serial.println("CAN init failed");
@@ -847,7 +902,7 @@ void setup() {
   lcd.setRotation(1);
   lcd.fillScreen(ST77XX_BLACK);
 
-  const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
+  const float busCurrent = -(odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f);
   const float motorPhaseCurrent = 0.0f;
   const float power = filterPower(vbusVoltage * busCurrent);
   const float rpm = odriveUserData.received_feedback ? odriveUserData.last_feedback.Vel_Estimate * 60.0f : 0.0f;
@@ -940,9 +995,9 @@ void loop() {
   const float targetVelRevPerSec = targetRpm / 60.0f;
 
 
-  const bool heartbeatFresh = odriveUserData.received_heartbeat && ((now - odriveUserData.last_heartbeat_ms) < 1500);
-  const bool feedbackFresh = odriveUserData.received_feedback && ((now - odriveUserData.last_feedback_ms) < 1500);
-  const bool vbusFresh = odriveUserData.received_vbus && ((now - odriveUserData.last_vbus_ms) < 1500);
+  const bool heartbeatFresh = odriveUserData.received_heartbeat && ((int32_t)(now - odriveUserData.last_heartbeat_ms) < 1500);
+  const bool feedbackFresh = odriveUserData.received_feedback && ((int32_t)(now - odriveUserData.last_feedback_ms) < 1500);
+  const bool vbusFresh = odriveUserData.received_vbus && ((int32_t)(now - odriveUserData.last_vbus_ms) < 1500);
   const bool telemetryFresh = heartbeatFresh || feedbackFresh || vbusFresh;
   const ODriveAxisState state = heartbeatFresh
     ? static_cast<ODriveAxisState>(odriveUserData.last_heartbeat.Axis_State)
@@ -962,24 +1017,13 @@ void loop() {
 
   writeServoPulseUs(servoPulseUs);
 
-  // Request bus voltage/current and motor Iq (not broadcast; must be polled).
-  {
-    Get_Bus_Voltage_Current_msg_t busVI;
-    if (odrive.getBusVI(busVI, 10)) {
-      odriveUserData.last_vbus = busVI;
-      odriveUserData.received_vbus = true;
-      odriveUserData.last_vbus_ms = now;
-    }
-  }
-  Get_Iq_msg_t iqMsg;
-  float motorIqA = 0.0f;
-  if (odrive.getCurrents(iqMsg, 10)) {
-    motorIqA = iqMsg.Iq_Measured;
-  }
+  // Bus voltage/current, Iq, and error are received via cyclic broadcasts
+  // configured on the ODrive (vbus/iq/error msg_rate_ms). No polling needed.
+  const float motorIqA = -(odriveUserData.received_iq ? odriveUserData.last_iq.Iq_Measured : 0.0f);
 
   if (canMonitorOnlyMode) {
     const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
-    const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
+    const float busCurrent = -(odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f);
     const float power = filterPower(vbusVoltage * busCurrent);
     const float rpm = odriveUserData.received_feedback
       ? filterRpm(odriveUserData.last_feedback.Vel_Estimate * 60.0f)
@@ -1010,25 +1054,10 @@ void loop() {
       Serial.print("Current axis state: ");
       Serial.println(axisStateToText(state));
     }
-
-    if (now >= nextErrorQueryMs) {
-      nextErrorQueryMs = now + 1000;
-      twai_status_info_t status;
-      if (twai_get_status_info(&status) == ESP_OK && status.msgs_to_tx == 0) {
-        Get_Error_msg_t err;
-        if (odrive.getError(err, 30)) {
-          Serial.print("ODrive Active_Errors=0x");
-          Serial.print(err.Active_Errors, HEX);
-          Serial.print(" Disarm_Reason=0x");
-          Serial.println(err.Disarm_Reason, HEX);
-        } else {
-          Serial.println("ODrive getError timeout");
-        }
-      }
-    }
+    // Errors are logged from onError() callback whenever they change.
 
     const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
-    const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
+    const float busCurrent = -(odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f);
     const float power = filterPower(vbusVoltage * busCurrent);
     const float rpm = odriveUserData.received_feedback
       ? filterRpm(odriveUserData.last_feedback.Vel_Estimate * 60.0f)
@@ -1064,9 +1093,9 @@ void loop() {
   //Serial.println(targetRpm, 1);
 
   const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
-  const float busCurrent = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f;
+  const float busCurrent = -(odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f);
   const float motorPhaseCurrent = motorIqA;
-  const float torque = odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f;
+  const float torque = -(odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f);
   const float power = filterPower(vbusVoltage * busCurrent);
   const float rpm = odriveUserData.received_feedback
     ? filterRpm(odriveUserData.last_feedback.Vel_Estimate * 60.0f)
