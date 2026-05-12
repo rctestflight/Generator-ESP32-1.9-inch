@@ -27,8 +27,8 @@ const unsigned long pollIntervalMs = 100;
 const bool canMonitorOnlyMode = false;
 const float maxTargetRpm = 8000.0f;
 const float testSequenceSetpointThresholdRpm = 2500.0f;
-const float powerFilterAlpha = 0.8f; //0.1 bigger number = less filtering
-const float rpmFilterAlpha = 0.2f;   // Smaller number = smoother RPM
+const float powerFilterAlpha = 0.4f; //0.1 bigger number = less filtering
+const float rpmFilterAlpha = 0.08f;   // Smaller number = smoother RPM
 const double rateFilterAlpha = 0.5f; // Smaller number = smoother rate value
 const float servoPotFilterAlpha = 0.35f; // Lower = smoother servo us, higher = faster response.
 float currentSoftMaxMax = 70.0f;
@@ -383,6 +383,7 @@ double lastAcceptedRateGPerMin = 0.0;
 bool lastAcceptedRateInitialized = false;
 double lastWeightForRate = 0.0;
 unsigned long lastRateCalcMs = 0;
+int loadCellSampleCount = 0;
 
 // ---------------- Potentiometer Median Filter ----------------
 int a0Buffer[3] = {0, 0, 0};
@@ -530,7 +531,11 @@ void updateLoadCell(unsigned long now) {
 
   weight = total / numReadings;
 
-  if (lastRateCalcMs == 0) {
+  // Wait for the moving-average buffer to be fully populated before computing
+  // rate. Until then, keep sliding lastWeightForRate forward so the first real
+  // rate sample starts from a stable, fully-warmed baseline.
+  if (loadCellSampleCount < numReadings) {
+    loadCellSampleCount++;
     lastRateCalcMs = now;
     lastWeightForRate = weight;
     weightRateGPerMin = 0.0;
@@ -747,8 +752,15 @@ void resetMeasurementsAfterTare(unsigned long now) {
   lastAcceptedRateGPerMin = 0.0;
   lastAcceptedRateInitialized = false;
   rateFilterInitialized = false;
-  lastWeightForRate = weight;
-  lastRateCalcMs = now;
+  // Reset the moving-average buffer so the post-tare warmup is clean.
+  for (int i = 0; i < numReadings; i++) {
+    readings[i] = 0.0;
+  }
+  total = 0.0;
+  readIndex = 0;
+  loadCellSampleCount = 0;
+  lastWeightForRate = 0.0;
+  lastRateCalcMs = 0;
 }
 
 void startServoTestSequence(unsigned long now) {
@@ -887,7 +899,7 @@ void setup() {
 
   if (inClosedLoopAfterSetup) {
     Serial.println("ODrive running!");
-    odrive.setLimits(100.0f, currentSoftMaxMax);
+    odrive.setLimits(maxTargetRpm / 60.0f, currentSoftMaxMax);
   } else if (canMonitorOnlyMode) {
     Serial.println("CAN monitor-only mode: skipping closed-loop and setpoint commands.");
   } else {
@@ -923,11 +935,11 @@ void setup() {
   appendGraphSample(rpm, power, 0.0f);
   drawGraph();
 
-    //HX711 Setup------------
+    //HX711 Setup------------69.65
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   Serial.println("HX711 initialized");
-  scale.set_scale(-18135); //-760.8
-  scale.set_offset(-25600); //507060
+  scale.set_scale(-18150); //-760.8
+  scale.set_offset(-302952); //-25600
   // Initialize all the readings to 0:
   for (int i = 0; i < numReadings; i++) {
       readings[i] = 0.0;
@@ -935,10 +947,10 @@ void setup() {
 }
 
 void loop() {
-  const unsigned long now = millis();
-
   recoverCan();
   pumpEvents(can_intf);
+
+  const unsigned long now = millis();
 
   updateLoadCell(now);
 
@@ -1083,9 +1095,9 @@ void loop() {
   }
 
   if (targetVelRevPerSec < 1.0f) {
-    odrive.setLimits(100.0f, 0.0f);
+    odrive.setLimits((maxTargetRpm / 60.0f), 0.0f);
   } else {
-    odrive.setLimits(100.0f, currentSoftMaxMax);
+    odrive.setLimits((maxTargetRpm / 60.0f), currentSoftMaxMax);
   }
   
   odrive.setVelocity(targetVelRevPerSec);
@@ -1105,9 +1117,9 @@ void loop() {
     : 0.0;
 
 
- // Serial.print(" Weight: ");
- // Serial.println(weight); 
- 
+  //Serial.print(" Weight: ");
+  //Serial.println(scale.get_units(10)); 
+  ///*
   Serial.print(servoPulseUs);
   Serial.print(",");
   Serial.print(torque);
@@ -1119,7 +1131,7 @@ void loop() {
   Serial.print(weightRateGPerMin, 1);
   Serial.print(",");
   Serial.println(efficiency, 1);
-
+  //*/
 
 
   wattHours += power * (pollIntervalMs / 1000.0f / 3600.0f);
