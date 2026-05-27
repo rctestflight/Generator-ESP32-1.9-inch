@@ -139,6 +139,13 @@ public:
     bool getCurrents(Get_Iq_msg_t& msg, uint16_t timeout_ms = 10);
 
     /**
+     * @brief Requests torque estimates
+     *
+     * This function will block and wait for up to timeout_ms (default 10msec) for ODrive to reply
+     */
+    bool getTorques(Get_Torques_msg_t& msg, uint16_t timeout_ms = 10);
+
+    /**
      * @brief Requests motor temperature
      *
      * This function will block and wait for up to timeout_ms (default 10msec) for ODrive to reply

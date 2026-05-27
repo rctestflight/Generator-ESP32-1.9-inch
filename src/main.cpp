@@ -19,20 +19,23 @@ const int canRxPin = 16;
 const int potPinA3 = A3;
 const int potPinA0 = A0;
 const int servoPin = 26;
-const int resetButtonPin = 25;
+const int resetButtonPin = 33;
 const long canBaudrate = 1000000;
 const int odriveNodeId = 0;
 const unsigned long pollIntervalMs = 100;
 const bool canMonitorOnlyMode = false;
 const float maxTargetRpm = 8000.0f;
-const float powerFilterAlpha = 0.4f; //0.1 bigger number = less filtering
-const float rpmFilterAlpha = 0.1f;   // Smaller number = smoother RPM
+const float powerFilterAlpha = 0.02f; // bigger number = less filtering
+const float rpmFilterAlpha = 0.05f;   // Smaller number = smoother RPM
+const float torqueFilterAlpha = 0.05f; // bigger number = less filtering
 float currentSoftMaxMax = 70.0f;
 float wattHours = 0.00f;
 float filteredPower = 0.0f;
 bool powerFilterInitialized = false;
 float filteredRpm = 0.0f;
 bool rpmFilterInitialized = false;
+float filteredTorque = 0.0f;
+bool torqueFilterInitialized = false;
 
 //#define SERVO_CALIBRATION_MODE  // Uncomment to enable: pot A3 sweeps servo from min to max pulse
 const int servoPulseMinUs = 1000; //should correspond to idle on carburetor
@@ -40,6 +43,9 @@ const int servoPulseMaxUs = 2000; //should correspond to wide open on carburetor
 const int idleRPM = 3000;         // RPM at minimum power setpoint (startup target)
 const int powerSetpointMinW = 100;
 const int powerSetpointMaxW = 700;
+const float vFoldbackOnsetV  = 50.0f;  // voltage at which foldback begins
+const float vFoldbackFullV   = 50.4f;  // voltage at which power is clamped to minimum
+const float vOvervoltageTripV = 50.5f; // voltage at which motor ramps down; restarts below vFoldbackOnsetV
 const int servoPwmChannel = 0;
 const int servoPwmFrequencyHz = 50;
 const int servoPwmResolutionBits = 16;
@@ -112,17 +118,19 @@ struct ODriveUserData {
 
 unsigned long lastPollMs = 0;
 bool odriveConnected = false;
-int lastResetButtonState = HIGH;
+int lastSwitchRaw = HIGH;
+int stableSwitchState = HIGH;         // debounced switch level: LOW=on, HIGH=off
+unsigned long switchDebounceMs = 0;
+const unsigned long switchDebounceDelayMs = 50;
 unsigned long nextClosedLoopRequestMs = 0;
 volatile uint32_t rawCanRxCount = 0;
 volatile uint32_t lastRawCanId = 0;
 
-enum EngineState { ENGINE_OFF, ENGINE_STARTING, ENGINE_RUNNING, ENGINE_STOPPING, ENGINE_COOLDOWN };
+enum EngineState { ENGINE_OFF, ENGINE_STARTING, ENGINE_RUNNING, ENGINE_STOPPING };
 EngineState engineState = ENGINE_OFF;
 float velocityCmd = 0.0f;
 unsigned long rampStartMs = 0;
 float rampStartVel = 0.0f;
-unsigned long cooldownStartMs = 0;
 
 void onHeartbeat(Heartbeat_msg_t& msg, void* user_data) {
   ODriveUserData* d = static_cast<ODriveUserData*>(user_data);
@@ -280,9 +288,19 @@ bool requestClosedLoopIfSafe(unsigned long now, bool logState) {
   return ok;
 }
 
-// ---------------- Potentiometer Median Filter ----------------
+// ---------------- Potentiometer Median Filter + Hysteresis ----------------
+const int potHysteresisThreshold = 60; // ADC counts (12-bit) to ignore — prevents servo jitter
 int a0Buffer[3] = {0, 0, 0};
 int a0BufferIndex = 0;
+int stableA0Raw = -1;
+int stableA3Raw = -1;
+
+int applyPotHysteresis(int newVal, int& stableVal) {
+  if (stableVal < 0 || abs(newVal - stableVal) > potHysteresisThreshold) {
+    stableVal = newVal;
+  }
+  return stableVal;
+}
 
 int getMedian(int v1, int v2, int v3) {
   if (v1 > v2) {
@@ -330,6 +348,16 @@ float filterPower(float rawPower) {
   return filteredPower;
 }
 
+float filterTorque(float rawTorque) {
+  if (!torqueFilterInitialized) {
+    filteredTorque = rawTorque;
+    torqueFilterInitialized = true;
+    return filteredTorque;
+  }
+  filteredTorque += (rawTorque - filteredTorque) * torqueFilterAlpha;
+  return filteredTorque;
+}
+
 float filterRpm(float rawRpm) {
   if (!rpmFilterInitialized) {
     filteredRpm = rawRpm;
@@ -370,7 +398,6 @@ const char* engineStateToText(EngineState s) {
     case ENGINE_STARTING: return "STARTING";
     case ENGINE_RUNNING:  return "RUNNING";
     case ENGINE_STOPPING: return "STOPPING";
-    case ENGINE_COOLDOWN: return "COOLDOWN";
     default:              return "UNKNOWN";
   }
 }
@@ -454,7 +481,7 @@ void drawLine(const char* text, int y, uint16_t color, uint8_t textSize) {
   lcd.print(text);
 }
 
-void redrawDisplay(const char* stateText, float vbusVoltage, float busCurrent, float motorPhaseCurrent, float power, float rpm, bool isClosedLoop, float wattHours, int servoPulseUs, int powerSetpointW, bool engineOn) {
+void redrawDisplay(const char* stateText, float vbusVoltage, float busCurrent, float motorPhaseCurrent, float power, float rpm, bool isClosedLoop, float wattHours, int servoPulseUs, int powerSetpointW, bool engineOn, float torqueNm) {
   char line[48];
 
   // Prevent long text from wrapping into the graph area.
@@ -500,6 +527,9 @@ void redrawDisplay(const char* stateText, float vbusVoltage, float busCurrent, f
   lcd.setTextColor(ST77XX_CYAN);
   snprintf(line, sizeof(line), " %dus", servoPulseUs);
   lcd.print(line);
+  lcd.setTextColor(ST77XX_MAGENTA);
+  snprintf(line, sizeof(line), " %.1fNm", torqueNm);
+  lcd.print(line);
 }
 
 const char* axisStateToText(ODriveAxisState state) {
@@ -537,7 +567,7 @@ void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
   pinMode(potPinA0, INPUT);
-  pinMode(resetButtonPin, INPUT_PULLUP);
+  pinMode(resetButtonPin, INPUT_PULLUP);  // HIGH = 0ff, LOW = on
   ledcSetup(servoPwmChannel, servoPwmFrequencyHz, servoPwmResolutionBits);
   ledcAttachPin(servoPin, servoPwmChannel);
   writeServoPulseUs(servoPulseMinUs);
@@ -604,47 +634,10 @@ void setup() {
   //Serial.println(vbusVoltage);
 
   if (!canMonitorOnlyMode) {
-    Serial.println("Enabling closed loop control...");
-    const unsigned long closedLoopTimeoutMs = millis() + 6000;
-    unsigned long nextClosedLoopStatusPrintMs = 0;
-    while (odriveUserData.last_heartbeat.Axis_State != AXIS_STATE_CLOSED_LOOP_CONTROL && millis() < closedLoopTimeoutMs) {
-      requestClosedLoopIfSafe(millis(), false);
-
-      const unsigned long nowMs = millis();
-      if (nowMs >= nextClosedLoopStatusPrintMs) {
-        nextClosedLoopStatusPrintMs = nowMs + 500;
-        const ODriveAxisState state = static_cast<ODriveAxisState>(odriveUserData.last_heartbeat.Axis_State);
-        Serial.print("Axis state: ");
-        Serial.print(axisStateToText(state));
-        Serial.print(" | Axis error: 0x");
-        Serial.println(odriveUserData.last_heartbeat.Axis_Error, HEX);
-      }
-
-      for (int i = 0; i < 15; ++i) {
-        delay(10);
-        pumpEvents(can_intf);
-      }
-    }
-
-    if (odriveUserData.last_heartbeat.Axis_State != AXIS_STATE_CLOSED_LOOP_CONTROL) {
-      Serial.println("Closed-loop entry timed out.");
-      Serial.print("Final axis state: ");
-      Serial.println(axisStateToText(static_cast<ODriveAxisState>(odriveUserData.last_heartbeat.Axis_State)));
-      Serial.print("Final axis error: 0x");
-      Serial.println(odriveUserData.last_heartbeat.Axis_Error, HEX);
-    }
-  }
-
-  const bool inClosedLoopAfterSetup =
-    (odriveUserData.last_heartbeat.Axis_State == AXIS_STATE_CLOSED_LOOP_CONTROL);
-
-  if (inClosedLoopAfterSetup) {
-    Serial.println("ODrive ready (engine OFF).");
-    odrive.setLimits(maxTargetRpm / 60.0f, 0.0f);  // Start with current = 0
-  } else if (canMonitorOnlyMode) {
-    Serial.println("CAN monitor-only mode: skipping closed-loop and setpoint commands.");
+    odrive.setState(AXIS_STATE_IDLE);
+    Serial.println("ODrive ready (engine OFF, axis IDLE).");
   } else {
-    Serial.println("ODrive not in closed loop yet; continuing in monitor mode.");
+    Serial.println("CAN monitor-only mode: skipping axis state commands.");
   }
 
   // Initialize display after CAN startup to match the known-good minimal CAN startup behavior.
@@ -666,11 +659,12 @@ void setup() {
     motorPhaseCurrent,
     power,
     rpm,
-    inClosedLoopAfterSetup,
+    false,
     0.0f,
     servoPulseMinUs,
     0,
-    false
+    false,
+    0.0f
   );
   appendGraphSample(rpm, power);
   drawGraph();
@@ -700,32 +694,57 @@ void loop() {
 #endif
 
   const unsigned long now = millis();
+  const float vbusNow = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
 
-  // --- Button edge detection (outside poll gate for responsiveness) ---
-  const int buttonState = digitalRead(resetButtonPin);
-  const bool buttonPressed = (lastResetButtonState == HIGH) && (buttonState == LOW);
-  lastResetButtonState = buttonState;
+  // --- Motor switch: HIGH = on, LOW = off ---
+  const int switchRaw = digitalRead(resetButtonPin);
+  //Serial.print("[SW] pin33 raw=");
+  //Serial.println(switchRaw);
+  if (switchRaw != lastSwitchRaw) {
+    lastSwitchRaw = switchRaw;
+    switchDebounceMs = now;
+  }
+  if ((now - switchDebounceMs) >= switchDebounceDelayMs) {
+    stableSwitchState = switchRaw;
+  }
 
-  if (buttonPressed) {
-    if (engineState == ENGINE_OFF) {
+  if (stableSwitchState == LOW) {   // LOW = on (switch pulls to GND)
+    if (engineState == ENGINE_OFF && vbusNow < vFoldbackOnsetV) {
       engineState = ENGINE_STARTING;
-      rampStartMs = now;
-      rampStartVel = velocityCmd;
+      rampStartMs = now + 1000;  // 1 s for closed-loop to engage before spinning
+      rampStartVel = 0.0f;
       wattHours = 0.0f;
-      Serial.println("Engine starting");
-    } else if (engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING) {
+      odrive.setLimits(maxTargetRpm / 60.0f, currentSoftMaxMax);
+      odrive.setState(AXIS_STATE_CLOSED_LOOP_CONTROL);
+      Serial.println("Engine starting: requesting closed-loop");
+    }
+  } else {                           // HIGH = off
+    if (engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING) {
       engineState = ENGINE_STOPPING;
       rampStartMs = now;
       rampStartVel = velocityCmd;
       Serial.println("Engine stopping");
     }
-    // Ignore button during STOPPING or COOLDOWN.
+    // STOPPING runs to completion regardless of switch.
+  }
+
+  // Overvoltage trip: ramp down if bus voltage exceeds trip threshold
+  if (vbusNow >= vOvervoltageTripV && (engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING)) {
+    engineState = ENGINE_STOPPING;
+    rampStartMs = now;
+    rampStartVel = velocityCmd;
+    Serial.println("Overvoltage trip: ramping down");
   }
 
   // --- State machine: update velocity command and servo position ---
   const float idleVelRevPerSec = idleRPM / 60.0f;
-  const int a0Filtered = filterPotentiometer(analogRead(potPinA0));
-  const float powerSetpointW = powerSetpointMinW + (a0Filtered / 4095.0f) * (float)(powerSetpointMaxW - powerSetpointMinW);
+  const int a0Filtered = applyPotHysteresis(filterPotentiometer(analogRead(potPinA0)), stableA0Raw);
+  float powerSetpointW = powerSetpointMinW + (a0Filtered / 4095.0f) * (float)(powerSetpointMaxW - powerSetpointMinW);
+
+  // Voltage foldback: proportionally cap power setpoint when bus voltage is high
+  const float foldbackFrac = constrain((vbusNow - vFoldbackOnsetV) / (vFoldbackFullV - vFoldbackOnsetV), 0.0f, 1.0f);
+  const float foldbackCeilingW = powerSetpointMaxW - foldbackFrac * (powerSetpointMaxW - powerSetpointMinW);
+  if (powerSetpointW > foldbackCeilingW) powerSetpointW = foldbackCeilingW;
 
   int servoPulseUs = servoPulseMinUs;
   int powerSetpointDisplayW = 0;
@@ -736,14 +755,19 @@ void loop() {
       break;
 
     case ENGINE_STARTING: {
-      const float elapsed = (float)(now - rampStartMs);
-      const float t = elapsed / 3000.0f;
-      if (t >= 1.0f) {
-        velocityCmd = idleVelRevPerSec;
-        engineState = ENGINE_RUNNING;
-        Serial.println("Engine running");
+      const long elapsed = (long)(now - rampStartMs);
+      if (elapsed < 0) {
+        // Pre-spin delay: waiting for closed-loop to engage
+        velocityCmd = 0.0f;
       } else {
-        velocityCmd = rampStartVel + (idleVelRevPerSec - rampStartVel) * t;
+        const float t = (float)elapsed / 1500.0f;
+        if (t >= 1.0f) {
+          velocityCmd = idleVelRevPerSec;
+          engineState = ENGINE_RUNNING;
+          Serial.println("Engine running");
+        } else {
+          velocityCmd = idleVelRevPerSec * t;
+        }
       }
       powerSetpointDisplayW = powerSetpointMinW;
       break;
@@ -764,23 +788,21 @@ void loop() {
       const float t = elapsed / 1000.0f;
       if (t >= 1.0f) {
         velocityCmd = 0.0f;
-        engineState = ENGINE_COOLDOWN;
-        cooldownStartMs = now;
-        Serial.println("Engine cooldown");
+        odrive.setState(AXIS_STATE_IDLE);
+        engineState = ENGINE_OFF;
+        Serial.println("Engine off, ODrive idle");
       } else {
         velocityCmd = rampStartVel * (1.0f - t);
       }
       break;
     }
+  }
 
-    case ENGINE_COOLDOWN:
-      velocityCmd = 0.0f;
-      if (now - cooldownStartMs >= 2000) {
-        odrive.setLimits(maxTargetRpm / 60.0f, 0.0f);
-        engineState = ENGINE_OFF;
-        Serial.println("Engine off");
-      }
-      break;
+  // A3 servo trim: max A3 (4095) = no reduction, min A3 (0) = -100us
+  if (engineState == ENGINE_RUNNING) {
+    const int a3Raw = applyPotHysteresis(analogRead(potPinA3), stableA3Raw);
+    const int reductionUs = (int)((1.0f - a3Raw / 4095.0f) * 100.0f + 0.5f);
+    servoPulseUs = clampInt(servoPulseUs - reductionUs, servoPulseMinUs, servoPulseMaxUs);
   }
 
   // --- Poll interval gate for ODrive telemetry + display ---
@@ -803,7 +825,7 @@ void loop() {
     filteredPower = 0.0f;
     rpmFilterInitialized = false;
     filteredRpm = 0.0f;
-    redrawDisplay("WAITING", 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, wattHours, servoPulseMinUs, 0, false);
+    redrawDisplay("WAITING", 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, wattHours, servoPulseMinUs, 0, false, 0.0f);
     appendGraphSample(0.0f, 0.0f);
     drawGraph();
     return;
@@ -811,7 +833,6 @@ void loop() {
 
   writeServoPulseUs(servoPulseUs);
 
-  // Bus voltage/current, Iq, and error are received via cyclic broadcasts.
   const float motorIqA = -(odriveUserData.received_iq ? odriveUserData.last_iq.Iq_Measured : 0.0f);
 
   if (canMonitorOnlyMode) {
@@ -825,7 +846,8 @@ void loop() {
       engineStateToText(engineState),
       vbusVoltage, busCurrent, motorIqA, power, rpm,
       false, wattHours, servoPulseUs, powerSetpointDisplayW,
-      engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING
+      engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING,
+      filterTorque(-(odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f))
     );
     appendGraphSample(rpm, power);
     drawGraph();
@@ -834,7 +856,8 @@ void loop() {
 
   // Only send motion commands in CLOSED_LOOP_CONTROL.
   if (state != AXIS_STATE_CLOSED_LOOP_CONTROL) {
-    if (requestClosedLoopIfSafe(now, true)) {
+    // In ENGINE_OFF we want IDLE — do not request closed-loop.
+    if (engineState != ENGINE_OFF && requestClosedLoopIfSafe(now, true)) {
       Serial.print("Current axis state: ");
       Serial.println(axisStateToText(state));
     }
@@ -848,7 +871,8 @@ void loop() {
       axisStateToText(state),
       vbusVoltage, busCurrent, motorIqA, power, rpm,
       false, wattHours, servoPulseUs, powerSetpointDisplayW,
-      engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING
+      engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING,
+      filterTorque(-(odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f))
     );
     appendGraphSample(rpm, power);
     drawGraph();
@@ -856,31 +880,22 @@ void loop() {
   }
 
   // Send ODrive commands based on engine state.
-  if (engineState == ENGINE_COOLDOWN) {
-    odrive.setVelocity(0.0f);
-    // Current limit is set to 0 when the cooldown timer expires (above).
-  } else if (engineState != ENGINE_OFF) {
+  if (engineState == ENGINE_STOPPING) {
+    odrive.setVelocity(velocityCmd);
+  } else if (engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING) {
     odrive.setLimits(maxTargetRpm / 60.0f, currentSoftMaxMax);
     odrive.setVelocity(velocityCmd);
   }
-  // ENGINE_OFF: no commands sent; current limit is already 0.
+  // ENGINE_OFF: ODrive is in IDLE, no commands sent.
 
   const float vbusVoltage = odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Voltage : 0.0f;
   const float busCurrent = -(odriveUserData.received_vbus ? odriveUserData.last_vbus.Bus_Current : 0.0f);
   const float motorPhaseCurrent = motorIqA;
-  const float torque = -(odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f);
+  const float torque = filterTorque(-(odriveUserData.received_torques ? odriveUserData.last_torques.Torque_Estimate : 0.0f));
   const float power = filterPower(vbusVoltage * busCurrent);
   const float rpm = odriveUserData.received_feedback
     ? filterRpm(odriveUserData.last_feedback.Vel_Estimate * 60.0f)
     : 0.0f;
-
-  Serial.print(powerSetpointDisplayW);
-  Serial.print(",");
-  Serial.print(torque);
-  Serial.print(",");
-  Serial.print(rpm, 1);
-  Serial.print(",");
-  Serial.println(power);
 
   wattHours += power * (pollIntervalMs / 1000.0f / 3600.0f);
 
@@ -889,7 +904,8 @@ void loop() {
     vbusVoltage, busCurrent, motorPhaseCurrent, power, rpm,
     state == AXIS_STATE_CLOSED_LOOP_CONTROL,
     wattHours, servoPulseUs, powerSetpointDisplayW,
-    engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING
+    engineState == ENGINE_STARTING || engineState == ENGINE_RUNNING,
+    torque
   );
 
   appendGraphSample(rpm, power);

@@ -110,6 +110,10 @@ bool ODriveCAN::getCurrents(Get_Iq_msg_t& msg, uint16_t timeout_ms) {
     return request(msg, timeout_ms);
 }
 
+bool ODriveCAN::getTorques(Get_Torques_msg_t& msg, uint16_t timeout_ms) {
+    return request(msg, timeout_ms);
+}
+
 bool ODriveCAN::getTemperature(Get_Temperature_msg_t& msg, uint16_t timeout_ms) {
     return request(msg, timeout_ms);
 }
